@@ -7,7 +7,7 @@ from pathlib import Path
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from pptx import Presentation
-from pptx.util import Inches
+from pptx.util import Inches, Pt
 
 TEMPLATE_PATH = "templates.pptx"
 PROTOTYPE_COUNT = 3
@@ -73,7 +73,7 @@ def add_textbox(slide, item):
     p.text = item["text"]
 
     run = p.runs[0]
-    run.font.size = item["font_size_pt"]
+    run.font.size = Pt(item.get("font_size", 14))
     run.font.bold = item["bold"]
     run.font.name = item["font_name"]
 
@@ -271,7 +271,6 @@ with left:
                 font_name = st.text_input("Police", value="Aptos")
 
             if st.button("Ajouter cet élément", width="stretch"):
-                from pptx.util import Pt
                 item = {
                     "kind": "text",
                     "x": x,
@@ -279,7 +278,7 @@ with left:
                     "w": w,
                     "h": h,
                     "text": text,
-                    "font_size_pt": Pt(font_size_value),
+                    "font_size": int(font_size_value),
                     "bold": bold,
                     "font_name": font_name,
                 }
