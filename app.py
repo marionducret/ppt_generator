@@ -28,6 +28,11 @@ PLACEHOLDERS = {
 
 # ---------- Helpers PPT ----------
 def duplicate_slide(prs: Presentation, source_slide_index: int):
+    """
+    Duplique une slide modèle en recopiant aussi les images.
+    Le simple deepcopy XML ne suffit pas pour les pictures car leurs relations
+    (blobs media) ne sont pas recopiées automatiquement.
+    """
     source = prs.slides[source_slide_index]
     layout = prs.slide_layouts[0] if prs.slide_layouts else prs.slide_master.slide_layouts[0]
     new_slide = prs.slides.add_slide(layout)
@@ -38,8 +43,28 @@ def duplicate_slide(prs: Presentation, source_slide_index: int):
         sp.getparent().remove(sp)
 
     for shape in source.shapes:
-        new_el = copy.deepcopy(shape.element)
-        new_slide.shapes._spTree.insert_element_before(new_el, 'p:extLst')
+        # Pictures need to be recreated from their image blob, otherwise
+        # image relationships are broken and logos may disappear.
+        if shape.shape_type == 13 and hasattr(shape, "image"):
+            image_stream = io.BytesIO(shape.image.blob)
+            pic = new_slide.shapes.add_picture(
+                image_stream,
+                shape.left,
+                shape.top,
+                width=shape.width,
+                height=shape.height,
+            )
+            # preserve cropping when present
+            try:
+                pic.crop_left = shape.crop_left
+                pic.crop_right = shape.crop_right
+                pic.crop_top = shape.crop_top
+                pic.crop_bottom = shape.crop_bottom
+            except Exception:
+                pass
+        else:
+            new_el = copy.deepcopy(shape.element)
+            new_slide.shapes._spTree.insert_element_before(new_el, 'p:extLst')
 
     return new_slide
 
