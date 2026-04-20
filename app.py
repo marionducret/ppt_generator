@@ -1,107 +1,132 @@
+import copy
 import io
 import os
 import uuid
-from dataclasses import dataclass, asdict
-from typing import List, Literal, Optional
+from pathlib import Path
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from pptx import Presentation
-from pptx.enum.text import PP_ALIGN
-from pptx.util import Inches, Pt
+from pptx.util import Inches
 
 TEMPLATE_PATH = "templates.pptx"
-SLIDE_W = 13.333  # inches for 16:9
-SLIDE_H = 7.5
-PREVIEW_W = 1280
-PREVIEW_H = 720
-
-TITLE_GENERAL_STYLE = {
-    "x": 1.0,
-    "y": 2.35,
-    "w": 11.3,
-    "h": 1.0,
-    "font_size": 28,
-    "bold": True,
-    "align": "center",
+PROTOTYPE_COUNT = 3
+SLIDE_SIZE = (1280, 720)
+CONTENT_BOUNDS = {
+    "x_min": 0.6,
+    "x_max": 9.2,
+    "y_min": 1.15,
+    "y_max": 6.7,
 }
 
-TITLE_SECTION_STYLE = {
-    "x": 1.0,
-    "y": 2.35,
-    "w": 11.3,
-    "h": 1.0,
-    "font_size": 24,
-    "bold": True,
-    "align": "center",
-}
-
-CONTENT_HEADER_STYLE = {
-    "x": 0.7,
-    "y": 0.18,
-    "w": 11.9,
-    "h": 0.5,
-    "font_size": 22,
-    "bold": True,
-    "align": "center",
-}
-
-CONTENT_ZONE = {
-    "x": 0.65,
-    "y": 1.05,
-    "w": 12.0,
-    "h": 6.0,
+PLACEHOLDERS = {
+    "Titre général": {"prototype_index": 0, "token": "{{TITLE_GENERAL}}"},
+    "Titre intermédiaire": {"prototype_index": 1, "token": "{{TITLE_SECTION}}"},
+    "Contenu": {"prototype_index": 2, "token": "{{CONTENT_TITLE}}"},
 }
 
 
-@dataclass
-class ContentItem:
-    kind: Literal["text", "image"]
-    x: float
-    y: float
-    w: float
-    h: float
-    text: str = ""
-    font_size: int = 14
-    bold: bool = False
-    image_bytes: Optional[bytes] = None
-    filename: str = ""
+# ---------- Helpers PPT ----------
+def duplicate_slide(prs: Presentation, source_slide_index: int):
+    source = prs.slides[source_slide_index]
+    layout = prs.slide_layouts[0] if prs.slide_layouts else prs.slide_master.slide_layouts[0]
+    new_slide = prs.slides.add_slide(layout)
+
+    # remove default placeholders from added slide
+    for shape in list(new_slide.shapes):
+        sp = shape.element
+        sp.getparent().remove(sp)
+
+    for shape in source.shapes:
+        new_el = copy.deepcopy(shape.element)
+        new_slide.shapes._spTree.insert_element_before(new_el, 'p:extLst')
+
+    return new_slide
 
 
-@dataclass
-class SlideSpec:
-    slide_type: Literal["title_general", "title_section", "content"]
-    title: str
-    items: Optional[List[ContentItem]] = None
+def replace_token_in_slide(slide, token: str, value: str) -> bool:
+    replaced = False
+    for shape in slide.shapes:
+        if not getattr(shape, "has_text_frame", False):
+            continue
+        if token not in shape.text:
+            continue
+
+        for paragraph in shape.text_frame.paragraphs:
+            for run in paragraph.runs:
+                if token in run.text:
+                    run.text = run.text.replace(token, value)
+                    replaced = True
+        if not replaced:
+            shape.text = shape.text.replace(token, value)
+            replaced = True
+    return replaced
 
 
-# ---------- Helpers ----------
+def add_textbox(slide, item):
+    box = slide.shapes.add_textbox(
+        Inches(item["x"]), Inches(item["y"]), Inches(item["w"]), Inches(item["h"])
+    )
+    tf = box.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    p.text = item["text"]
 
-def inches_to_px_x(value: float) -> int:
-    return int(value / SLIDE_W * PREVIEW_W)
-
-
-def inches_to_px_y(value: float) -> int:
-    return int(value / SLIDE_H * PREVIEW_H)
-
-
-def clamp_to_content_zone(x: float, y: float, w: float, h: float):
-    min_x = CONTENT_ZONE["x"]
-    min_y = CONTENT_ZONE["y"]
-    max_x = CONTENT_ZONE["x"] + CONTENT_ZONE["w"]
-    max_y = CONTENT_ZONE["y"] + CONTENT_ZONE["h"]
-
-    x = max(min_x, min(x, max_x - 0.2))
-    y = max(min_y, min(y, max_y - 0.2))
-    w = min(w, max_x - x)
-    h = min(h, max_y - y)
-    return round(x, 2), round(y, 2), round(w, 2), round(h, 2)
+    run = p.runs[0]
+    run.font.size = item["font_size_pt"]
+    run.font.bold = item["bold"]
+    run.font.name = item["font_name"]
 
 
-def get_font(size: int, bold: bool = False):
+def add_image(slide, item):
+    slide.shapes.add_picture(
+        item["path"],
+        Inches(item["x"]),
+        Inches(item["y"]),
+        width=Inches(item["w"]),
+        height=Inches(item["h"]),
+    )
+
+
+def remove_first_n_slides(prs: Presentation, n: int):
+    # remove prototype slides from final export
+    for _ in range(min(n, len(prs.slides))):
+        slide_id = prs.slides._sldIdLst[0]
+        r_id = slide_id.rId
+        prs.part.drop_rel(r_id)
+        del prs.slides._sldIdLst[0]
+
+
+def build_pptx(slides_data, output_path: str):
+    prs = Presentation(TEMPLATE_PATH)
+
+    for slide_data in slides_data:
+        spec = PLACEHOLDERS[slide_data["type"]]
+        slide = duplicate_slide(prs, spec["prototype_index"])
+
+        ok = replace_token_in_slide(slide, spec["token"], slide_data["title"])
+        if not ok:
+            raise ValueError(
+                f"Repère introuvable dans le template pour {slide_data['type']} : {spec['token']}"
+            )
+
+        if slide_data["type"] == "Contenu":
+            for item in slide_data.get("items", []):
+                if item["kind"] == "text":
+                    add_textbox(slide, item)
+                elif item["kind"] == "image":
+                    add_image(slide, item)
+
+    remove_first_n_slides(prs, PROTOTYPE_COUNT)
+    prs.save(output_path)
+    return output_path
+
+
+# ---------- Helpers preview ----------
+def load_font(size: int, bold: bool = False):
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -109,280 +134,231 @@ def get_font(size: int, bold: bool = False):
     return ImageFont.load_default()
 
 
-def add_wrapped_text(draw: ImageDraw.ImageDraw, box, text: str, font, fill=(20, 20, 20), align="left"):
-    x, y, w, h = box
-    words = text.split()
-    if not words:
-        return
-
-    lines = []
-    current = words[0]
-    for word in words[1:]:
-        trial = current + " " + word
-        trial_bbox = draw.textbbox((0, 0), trial, font=font)
-        if trial_bbox[2] - trial_bbox[0] <= w:
-            current = trial
-        else:
-            lines.append(current)
-            current = word
-    lines.append(current)
-
-    line_heights = []
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        line_heights.append(bbox[3] - bbox[1])
-    total_h = sum(line_heights) + max(0, len(lines) - 1) * 6
-
-    current_y = y + max(0, (h - total_h) // 2)
-    for idx, line in enumerate(lines):
-        bbox = draw.textbbox((0, 0), line, font=font)
-        line_w = bbox[2] - bbox[0]
-        line_h = bbox[3] - bbox[1]
-        if align == "center":
-            text_x = x + max(0, (w - line_w) // 2)
-        else:
-            text_x = x
-        draw.text((text_x, current_y), line, font=font, fill=fill)
-        current_y += line_h + 6
+def inch_to_px_x(v):
+    return int(v / 10 * SLIDE_SIZE[0])
 
 
-def render_slide_preview(slide_spec: SlideSpec) -> Image.Image:
-    img = Image.new("RGB", (PREVIEW_W, PREVIEW_H), "white")
+def inch_to_px_y(v):
+    return int(v / 7.5 * SLIDE_SIZE[1])
+
+
+def preview_image_for_slide(slide_data):
+    img = Image.new("RGB", SLIDE_SIZE, "white")
     draw = ImageDraw.Draw(img)
 
-    # Simple preview background approximating the template logic.
-    if slide_spec.slide_type == "title_general":
-        draw.rectangle([0, 0, PREVIEW_W, PREVIEW_H], fill=(42, 73, 108))
-        box = (
-            inches_to_px_x(TITLE_GENERAL_STYLE["x"]),
-            inches_to_px_y(TITLE_GENERAL_STYLE["y"]),
-            inches_to_px_x(TITLE_GENERAL_STYLE["w"]),
-            inches_to_px_y(TITLE_GENERAL_STYLE["h"]),
-        )
-        font = get_font(34, True)
-        add_wrapped_text(draw, box, slide_spec.title, font, fill=(255, 255, 255), align="center")
+    slide_type = slide_data["type"]
 
-    elif slide_spec.slide_type == "title_section":
-        draw.rectangle([0, 0, PREVIEW_W, PREVIEW_H], fill=(94, 131, 164))
-        box = (
-            inches_to_px_x(TITLE_SECTION_STYLE["x"]),
-            inches_to_px_y(TITLE_SECTION_STYLE["y"]),
-            inches_to_px_x(TITLE_SECTION_STYLE["w"]),
-            inches_to_px_y(TITLE_SECTION_STYLE["h"]),
-        )
-        font = get_font(30, True)
-        add_wrapped_text(draw, box, slide_spec.title, font, fill=(255, 255, 255), align="center")
+    if slide_type == "Titre général":
+        draw.rectangle([0, 0, SLIDE_SIZE[0], SLIDE_SIZE[1]], fill=(59, 84, 135))
+        font = load_font(34, bold=True)
+        title = slide_data["title"] or "Titre général"
+        bbox = draw.textbbox((0, 0), title, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text(((SLIDE_SIZE[0] - tw) / 2, (SLIDE_SIZE[1] - th) / 2), title, fill="white", font=font)
+
+    elif slide_type == "Titre intermédiaire":
+        draw.rectangle([0, 0, SLIDE_SIZE[0], SLIDE_SIZE[1]], fill=(103, 139, 196))
+        font = load_font(30, bold=True)
+        title = slide_data["title"] or "Titre intermédiaire"
+        bbox = draw.textbbox((0, 0), title, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text(((SLIDE_SIZE[0] - tw) / 2, (SLIDE_SIZE[1] - th) / 2), title, fill="white", font=font)
 
     else:
-        header_h = inches_to_px_y(0.8)
-        draw.rectangle([0, 0, PREVIEW_W, header_h], fill=(42, 73, 108))
-        cz = (
-            inches_to_px_x(CONTENT_ZONE["x"]),
-            inches_to_px_y(CONTENT_ZONE["y"]),
-            inches_to_px_x(CONTENT_ZONE["x"] + CONTENT_ZONE["w"]),
-            inches_to_px_y(CONTENT_ZONE["y"] + CONTENT_ZONE["h"]),
-        )
-        draw.rounded_rectangle(cz, outline=(210, 210, 210), width=3, radius=10)
+        header_h = 90
+        draw.rectangle([0, 0, SLIDE_SIZE[0], header_h], fill=(103, 139, 196))
+        draw.rectangle([40, header_h + 20, SLIDE_SIZE[0] - 40, SLIDE_SIZE[1] - 30], outline=(210, 210, 210), width=2)
 
-        title_box = (
-            inches_to_px_x(CONTENT_HEADER_STYLE["x"]),
-            inches_to_px_y(CONTENT_HEADER_STYLE["y"]),
-            inches_to_px_x(CONTENT_HEADER_STYLE["w"]),
-            inches_to_px_y(CONTENT_HEADER_STYLE["h"]),
-        )
-        font = get_font(26, True)
-        add_wrapped_text(draw, title_box, slide_spec.title, font, fill=(255, 255, 255), align="center")
+        font = load_font(24, bold=True)
+        title = slide_data["title"] or "Titre"
+        bbox = draw.textbbox((0, 0), title, font=font)
+        tw = bbox[2] - bbox[0]
+        draw.text(((SLIDE_SIZE[0] - tw) / 2, 28), title, fill="white", font=font)
 
-        for item in slide_spec.items or []:
-            x = inches_to_px_x(item.x)
-            y = inches_to_px_y(item.y)
-            w = inches_to_px_x(item.w)
-            h = inches_to_px_y(item.h)
-            rect = [x, y, x + w, y + h]
+        for item in slide_data.get("items", []):
+            x = inch_to_px_x(item["x"])
+            y = inch_to_px_y(item["y"])
+            w = inch_to_px_x(item["w"])
+            h = inch_to_px_y(item["h"])
 
-            if item.kind == "text":
-                draw.rounded_rectangle(rect, outline=(120, 120, 120), width=2, radius=8)
-                font = get_font(max(14, int(item.font_size * 1.5)), item.bold)
-                add_wrapped_text(draw, (x + 12, y + 12, w - 24, h - 24), item.text or "Texte", font)
-            else:
-                draw.rounded_rectangle(rect, outline=(120, 120, 120), width=2, radius=8, fill=(245, 245, 245))
-                if item.image_bytes:
-                    try:
-                        im = Image.open(io.BytesIO(item.image_bytes)).convert("RGB")
-                        im.thumbnail((max(40, w - 8), max(40, h - 8)))
-                        paste_x = x + (w - im.width) // 2
-                        paste_y = y + (h - im.height) // 2
-                        img.paste(im, (paste_x, paste_y))
-                    except Exception:
-                        draw.line([x + 10, y + 10, x + w - 10, y + h - 10], fill=(160, 160, 160), width=3)
-                        draw.line([x + w - 10, y + 10, x + 10, y + h - 10], fill=(160, 160, 160), width=3)
-                else:
-                    draw.line([x + 10, y + 10, x + w - 10, y + h - 10], fill=(160, 160, 160), width=3)
-                    draw.line([x + w - 10, y + 10, x + 10, y + h - 10], fill=(160, 160, 160), width=3)
-                    ph_font = get_font(20, True)
-                    add_wrapped_text(draw, (x + 12, y + 12, w - 24, h - 24), "Image", ph_font, align="center")
+            if item["kind"] == "text":
+                draw.rectangle([x, y, x + w, y + h], outline=(90, 90, 90), width=2)
+                tfont = load_font(18, bold=item.get("bold", False))
+                txt = item["text"][:180] if item["text"] else "Texte"
+                draw.multiline_text((x + 10, y + 10), txt, fill=(40, 40, 40), font=tfont, spacing=4)
+            elif item["kind"] == "image":
+                draw.rectangle([x, y, x + w, y + h], outline=(90, 90, 90), width=2)
+                draw.line([x, y, x + w, y + h], fill=(120, 120, 120), width=2)
+                draw.line([x + w, y, x, y + h], fill=(120, 120, 120), width=2)
+                label_font = load_font(18, bold=True)
+                label = "Image"
+                bbox = draw.textbbox((0, 0), label, font=label_font)
+                lw = bbox[2] - bbox[0]
+                lh = bbox[3] - bbox[1]
+                draw.text((x + (w - lw) / 2, y + (h - lh) / 2), label, fill=(80, 80, 80), font=label_font)
 
     return img
 
 
-def add_textbox(slide, cfg, text: str):
-    box = slide.shapes.add_textbox(
-        Inches(cfg["x"]), Inches(cfg["y"]), Inches(cfg["w"]), Inches(cfg["h"])
-    )
-    tf = box.text_frame
-    tf.clear()
-    p = tf.paragraphs[0]
-    p.text = text
-    p.alignment = PP_ALIGN.CENTER if cfg["align"] == "center" else PP_ALIGN.LEFT
-    run = p.runs[0]
-    run.font.size = Pt(cfg["font_size"])
-    run.font.bold = cfg["bold"]
-    run.font.name = "Aptos"
-
-
-def build_ppt(slides: List[SlideSpec]) -> bytes:
-    prs = Presentation(TEMPLATE_PATH)
-
-    # keep only template slides already in file and append generated slides after them
-    for spec in slides:
-        slide = prs.slides.add_slide(prs.slide_layouts[6])
-
-        if spec.slide_type == "title_general":
-            add_textbox(slide, TITLE_GENERAL_STYLE, spec.title)
-        elif spec.slide_type == "title_section":
-            add_textbox(slide, TITLE_SECTION_STYLE, spec.title)
-        else:
-            add_textbox(slide, CONTENT_HEADER_STYLE, spec.title)
-            for item in spec.items or []:
-                if item.kind == "text":
-                    shape = slide.shapes.add_textbox(
-                        Inches(item.x), Inches(item.y), Inches(item.w), Inches(item.h)
-                    )
-                    tf = shape.text_frame
-                    tf.clear()
-                    p = tf.paragraphs[0]
-                    p.text = item.text
-                    p.alignment = PP_ALIGN.LEFT
-                    run = p.runs[0]
-                    run.font.size = Pt(item.font_size)
-                    run.font.bold = item.bold
-                    run.font.name = "Aptos"
-                elif item.kind == "image" and item.image_bytes:
-                    slide.shapes.add_picture(
-                        io.BytesIO(item.image_bytes),
-                        Inches(item.x), Inches(item.y),
-                        width=Inches(item.w), height=Inches(item.h)
-                    )
-
-    buffer = io.BytesIO()
-    prs.save(buffer)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-# ---------- UI ----------
-st.set_page_config(page_title="Générateur Solimed", layout="wide")
-st.title("Générateur de présentation Solimed")
-st.caption("Version simple avec preview visuel et export PowerPoint")
+# ---------- Streamlit UI ----------
+st.set_page_config(page_title="Solimed PPT Builder", layout="wide")
+st.title("Solimed — Générateur de présentation")
+st.caption("Utilise les 3 slides modèles du fichier templates.pptx avec les repères {{TITLE_GENERAL}}, {{TITLE_SECTION}} et {{CONTENT_TITLE}}.")
 
 if "slides" not in st.session_state:
     st.session_state.slides = []
 
+if "draft_items" not in st.session_state:
+    st.session_state.draft_items = []
+
+
+def clamp_content_item(item):
+    item["x"] = max(CONTENT_BOUNDS["x_min"], min(item["x"], CONTENT_BOUNDS["x_max"] - 0.3))
+    item["y"] = max(CONTENT_BOUNDS["y_min"], min(item["y"], CONTENT_BOUNDS["y_max"] - 0.3))
+    item["w"] = max(0.5, min(item["w"], CONTENT_BOUNDS["x_max"] - item["x"]))
+    item["h"] = max(0.4, min(item["h"], CONTENT_BOUNDS["y_max"] - item["y"]))
+    return item
+
+
 with st.sidebar:
-    st.header("Nouvelle slide")
-    slide_type_ui = st.selectbox(
-        "Type de slide",
-        ["Titre général", "Titre intermédiaire", "Contenu"],
-    )
-    type_map = {
-        "Titre général": "title_general",
-        "Titre intermédiaire": "title_section",
-        "Contenu": "content",
-    }
-    slide_type = type_map[slide_type_ui]
-    title = st.text_input("Titre")
+    st.subheader("Template")
+    st.write(f"Fichier attendu : `{TEMPLATE_PATH}`")
+    if os.path.exists(TEMPLATE_PATH):
+        st.success("Template détecté")
+    else:
+        st.error("Template introuvable")
 
-    items: List[ContentItem] = []
-    if slide_type == "content":
-        st.markdown("### Éléments dans la zone blanche")
-        n_items = st.number_input("Nombre d'éléments", min_value=0, max_value=8, value=1, step=1)
+    st.subheader("Présentation")
+    if st.button("Supprimer la dernière slide", width="stretch"):
+        if st.session_state.slides:
+            st.session_state.slides.pop()
+    if st.button("Vider toute la présentation", width="stretch"):
+        st.session_state.slides = []
 
-        for i in range(n_items):
-            st.markdown(f"**Élément {i + 1}**")
-            kind_ui = st.selectbox("Type", ["Texte", "Image"], key=f"kind_{i}")
-            kind = "text" if kind_ui == "Texte" else "image"
+left, right = st.columns([1.05, 0.95])
 
-            col1, col2 = st.columns(2)
-            with col1:
-                x = st.number_input("x", 0.0, 12.5, 1.0, 0.1, key=f"x_{i}")
-                w = st.number_input("largeur", 0.3, 12.0, 4.0, 0.1, key=f"w_{i}")
-            with col2:
-                y = st.number_input("y", 0.8, 7.0, 1.4, 0.1, key=f"y_{i}")
-                h = st.number_input("hauteur", 0.3, 6.0, 2.0, 0.1, key=f"h_{i}")
+with left:
+    st.subheader("Créer une slide")
+    slide_type = st.selectbox("Type de slide", list(PLACEHOLDERS.keys()))
+    title = st.text_input("Titre", placeholder="Saisis le titre de la slide")
 
-            x, y, w, h = clamp_to_content_zone(x, y, w, h)
+    working_slide = {"type": slide_type, "title": title}
 
-            if kind == "text":
-                text = st.text_area("Texte", key=f"text_{i}")
-                font_size = st.slider("Taille police", 10, 28, 14, key=f"font_{i}")
-                bold = st.checkbox("Gras", key=f"bold_{i}")
-                items.append(ContentItem(kind="text", x=x, y=y, w=w, h=h, text=text, font_size=font_size, bold=bold))
-            else:
-                image_file = st.file_uploader("Image", type=["png", "jpg", "jpeg"], key=f"img_{i}")
-                image_bytes = image_file.getvalue() if image_file else None
-                filename = image_file.name if image_file else ""
-                items.append(ContentItem(kind="image", x=x, y=y, w=w, h=h, image_bytes=image_bytes, filename=filename))
+    if slide_type == "Contenu":
+        st.markdown("#### Ajouter un élément dans la zone blanche")
+        item_kind = st.selectbox("Type d’élément", ["text", "image"], format_func=lambda x: "Texte" if x == "text" else "Image")
 
-    current_slide = SlideSpec(slide_type=slide_type, title=title, items=items if slide_type == "content" else None)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            x = st.number_input("x", min_value=0.0, max_value=10.0, value=0.8, step=0.1)
+        with c2:
+            y = st.number_input("y", min_value=0.0, max_value=7.5, value=1.5, step=0.1)
+        with c3:
+            w = st.number_input("largeur", min_value=0.5, max_value=10.0, value=3.5, step=0.1)
+        with c4:
+            h = st.number_input("hauteur", min_value=0.4, max_value=7.0, value=1.5, step=0.1)
 
-    if st.button("Ajouter la slide", use_container_width=True):
+        if item_kind == "text":
+            text = st.text_area("Texte", height=140)
+            c5, c6, c7 = st.columns(3)
+            with c5:
+                font_size_value = st.number_input("Taille", min_value=8, max_value=36, value=14, step=1)
+            with c6:
+                bold = st.checkbox("Bold")
+            with c7:
+                font_name = st.text_input("Police", value="Aptos")
+
+            if st.button("Ajouter cet élément", width="stretch"):
+                from pptx.util import Pt
+                item = {
+                    "kind": "text",
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h,
+                    "text": text,
+                    "font_size_pt": Pt(font_size_value),
+                    "bold": bold,
+                    "font_name": font_name,
+                }
+                st.session_state.draft_items.append(clamp_content_item(item))
+
+        else:
+            uploaded = st.file_uploader("Image", type=["png", "jpg", "jpeg"])
+            if st.button("Ajouter cet élément", width="stretch"):
+                if uploaded is None:
+                    st.warning("Ajoute une image avant de valider.")
+                else:
+                    ext = Path(uploaded.name).suffix.lower() or ".png"
+                    tmp_path = f"tmp_{uuid.uuid4().hex}{ext}"
+                    with open(tmp_path, "wb") as f:
+                        f.write(uploaded.getbuffer())
+                    item = {
+                        "kind": "image",
+                        "x": x,
+                        "y": y,
+                        "w": w,
+                        "h": h,
+                        "path": tmp_path,
+                    }
+                    st.session_state.draft_items.append(clamp_content_item(item))
+
+        working_slide["items"] = st.session_state.draft_items
+
+        if st.session_state.draft_items:
+            st.markdown("#### Éléments déjà ajoutés")
+            for idx, item in enumerate(st.session_state.draft_items, start=1):
+                label = f"{idx}. {'Texte' if item['kind'] == 'text' else 'Image'} — x={item['x']}, y={item['y']}, w={item['w']}, h={item['h']}"
+                st.write(label)
+            if st.button("Effacer les éléments de cette slide", width="stretch"):
+                st.session_state.draft_items = []
+                st.rerun()
+
+    if st.button("Ajouter la slide à la présentation", width="stretch"):
         if not title.strip():
             st.error("Le titre est obligatoire.")
         else:
-            st.session_state.slides.append(current_slide)
+            slide_to_store = copy.deepcopy(working_slide)
+            if slide_type != "Contenu":
+                slide_to_store["items"] = []
+            st.session_state.slides.append(slide_to_store)
+            st.session_state.draft_items = []
             st.success("Slide ajoutée.")
 
-    if st.button("Supprimer la dernière", use_container_width=True):
-        if st.session_state.slides:
-            st.session_state.slides.pop()
-            st.success("Dernière slide supprimée.")
-
-    if st.button("Vider la présentation", use_container_width=True):
-        st.session_state.slides = []
-        st.success("Présentation vidée.")
-
-# Main area
-left, right = st.columns([1.1, 1.4])
-
-with left:
-    st.subheader("Preview de la slide en cours")
-    preview = render_slide_preview(current_slide)
-    st.image(preview, use_container_width=True)
-
-with right:
-    st.subheader("Slides de la présentation")
+    st.markdown("---")
+    st.subheader("Slides enregistrées")
     if not st.session_state.slides:
-        st.info("Aucune slide ajoutée pour le moment.")
+        st.info("Aucune slide pour le moment.")
     else:
         for idx, slide in enumerate(st.session_state.slides, start=1):
-            with st.expander(f"Slide {idx} — {slide.title}", expanded=False):
-                st.write(f"Type : {slide.slide_type}")
-                st.image(render_slide_preview(slide), use_container_width=True)
+            with st.expander(f"Slide {idx} — {slide['type']} — {slide['title']}"):
+                st.image(preview_image_for_slide(slide), width="stretch")
 
-st.divider()
-st.subheader("Export")
+with right:
+    st.subheader("Preview de la slide en cours")
+    st.image(preview_image_for_slide(working_slide), width="stretch")
 
-if not os.path.exists(TEMPLATE_PATH):
-    st.error("Le fichier templates.pptx doit être à la racine du projet.")
-else:
-    if st.session_state.slides:
-        ppt_bytes = build_ppt(st.session_state.slides)
-        st.download_button(
-            "Télécharger le PPT",
-            data=ppt_bytes,
-            file_name=f"presentation_{uuid.uuid4().hex[:8]}.pptx",
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            use_container_width=True,
-        )
-    else:
-        st.warning("Ajoute au moins une slide pour générer le PPT.")
+    st.markdown("---")
+    st.subheader("Export")
+    if st.button("Générer le PowerPoint", width="stretch"):
+        if not os.path.exists(TEMPLATE_PATH):
+            st.error("Le fichier templates.pptx doit être à la racine du repo.")
+        elif len(st.session_state.slides) == 0:
+            st.error("Ajoute au moins une slide avant de générer le fichier.")
+        else:
+            output_path = f"presentation_{uuid.uuid4().hex[:8]}.pptx"
+            try:
+                build_pptx(st.session_state.slides, output_path)
+                with open(output_path, "rb") as f:
+                    st.download_button(
+                        "Télécharger le PPT",
+                        data=f,
+                        file_name="presentation_solimed.pptx",
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        width="stretch",
+                    )
+                st.success("PowerPoint généré.")
+            except Exception as e:
+                st.error(f"Erreur pendant la génération : {e}")
